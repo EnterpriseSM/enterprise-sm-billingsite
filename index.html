@@ -393,7 +393,7 @@ body[data-theme="dark"] .profit-stat{background:#12243b;border-color:#2b4565}
     <h1>রূপান্তর কম্পিউটার</h1>
     <p class="login-sub">POS Management System • User Login</p>
     <form id="loginForm" autocomplete="off">
-      <div class="login-field"><label for="loginUsername">Username</label><input id="loginUsername" type="text" placeholder="Username" autocomplete="username" required></div>
+      <div class="login-field"><label for="loginUsername">Admin Email</label><input id="loginUsername" type="email" placeholder="Supabase Admin Email" autocomplete="username" required></div>
       <div class="login-field"><label for="loginPassword">Password</label><input id="loginPassword" type="password" placeholder="Password" autocomplete="current-password" required></div>
       <button class="login-btn" type="submit">🔐 Login</button>
       <div id="loginError" class="login-error"></div>
@@ -3235,6 +3235,236 @@ function initIncomeExpense(){
       setTimeout(appendAddressToInvoice,100);
     }
   });
+})();
+</script>
+
+
+<!-- Supabase Cloud Database + Auth integration for Rupantor POS -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script id="rupantor-supabase-integration">
+(function(){
+  'use strict';
+  const SUPABASE_URL = 'https://nazmpvjorviqobijvxqu.supabase.co';
+  const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_4JeLCW4w33kwiFI-QC_neg_LilA_-Nc';
+  const TABLE = 'rupantor_pos_state';
+  const STORE_ID = 'default-store';
+  const SESSION_KEY = 'pos_logged_in_user_v2';
+  const USERS_KEY = 'rupantor_pos_users_v2';
+  const HYDRATED_KEY = 'rupantor_cloud_hydrated_at';
+  let supabase = null;
+  let cloudReady = false;
+  let writeTimer = null;
+  let syncing = false;
+
+  function errorText(err){
+    const msg = String(err && (err.message || err.error_description) || 'Unknown error');
+    if(/Invalid login credentials/i.test(msg)) return 'ইমেইল অথবা পাসওয়ার্ড সঠিক নয়।';
+    if(/Failed to fetch|NetworkError/i.test(msg)) return 'ইন্টারনেট সংযোগ পরীক্ষা করে আবার চেষ্টা করুন।';
+    if(/row-level security|permission denied|42501/i.test(msg)) return 'ডাটাবেজ অনুমতি পাওয়া যায়নি। Supabase SQL/RLS সেটিং পরীক্ষা করুন।';
+    return msg;
+  }
+  function setError(msg){
+    const el = document.getElementById('loginError');
+    if(el) el.textContent = msg || '';
+  }
+  function setBusy(busy){
+    const btn = document.querySelector('#loginForm button[type="submit"], #loginForm button:not([type])');
+    if(btn){ btn.disabled = !!busy; btn.textContent = busy ? 'সংযোগ হচ্ছে...' : 'Login'; }
+  }
+  function appKeys(){
+    const keys=[];
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);
+      if(k && k.startsWith('rupantor_pos_') &&
+         k !== USERS_KEY &&
+         k !== 'rupantor_pos_users_v2' &&
+         k !== 'rupantor_pos_roles_v2') keys.push(k);
+    }
+    return keys.sort();
+  }
+  function makeSnapshot(){
+    const data={};
+    appKeys().forEach(k=>{ data[k]=localStorage.getItem(k); });
+    try{
+      if(typeof products!=='undefined' && Array.isArray(products) && !data['rupantor_pos_products'])
+        data['rupantor_pos_products']=JSON.stringify(products);
+      if(!data['rupantor_pos_sales']) data['rupantor_pos_sales']=localStorage.getItem('rupantor_pos_sales')||'[]';
+    }catch(e){}
+    return data;
+  }
+  function applySnapshot(data){
+    if(!data || typeof data!=='object' || Array.isArray(data)) return;
+    appKeys().forEach(k=>localStorage.removeItem(k));
+    Object.keys(data).forEach(k=>{
+      if(k.startsWith('rupantor_pos_') && typeof data[k]==='string'){
+        localStorage.setItem(k,data[k]);
+      }
+    });
+  }
+  async function readCloud(){
+    const {data,error}=await supabase.from(TABLE).select('state,updated_at').eq('id',STORE_ID).maybeSingle();
+    if(error) throw error;
+    return data;
+  }
+  async function writeCloud(){
+    if(!supabase || !cloudReady || syncing) return;
+    syncing=true;
+    try{
+      const {data:{user}}=await supabase.auth.getUser();
+      if(!user) return;
+      const payload={id:STORE_ID,state:makeSnapshot(),updated_at:new Date().toISOString(),updated_by:user.id};
+      const {error}=await supabase.from(TABLE).upsert(payload,{onConflict:'id'});
+      if(error) throw error;
+      localStorage.setItem(HYDRATED_KEY,payload.updated_at);
+      showCloudStatus('Cloud Sync সফল','success');
+    }catch(e){
+      console.error('Supabase save failed:',e);
+      showCloudStatus('Cloud Sync ব্যর্থ: '+errorText(e),'error');
+    }finally{ syncing=false; }
+  }
+  function queueCloudSave(){
+    if(!cloudReady) return;
+    clearTimeout(writeTimer);
+    writeTimer=setTimeout(writeCloud,900);
+  }
+  function showCloudStatus(message,type){
+    let el=document.getElementById('rupantorCloudStatus');
+    if(!el){
+      el=document.createElement('div');
+      el.id='rupantorCloudStatus';
+      el.style.cssText='position:fixed;right:14px;bottom:14px;z-index:99999;padding:9px 13px;border-radius:10px;background:#12345b;color:#fff;font:12px Arial;box-shadow:0 5px 20px #0002;max-width:min(90vw,420px)';
+      document.body.appendChild(el);
+    }
+    el.textContent=message;
+    el.style.background=type==='error'?'#991b1b':'#14532d';
+  }
+  async function syncCloudOnLogin(){
+    cloudReady=false;
+    const cloud=await readCloud();
+    const state=cloud && cloud.state && typeof cloud.state==='object' ? cloud.state : {};
+    const hasCloudData=Object.keys(state).length>0;
+    const marker=localStorage.getItem(HYDRATED_KEY);
+    if(!hasCloudData){
+      // First connection: preserve this browser's current POS data as the initial cloud copy.
+      await writeCloudInitial();
+      localStorage.setItem(HYDRATED_KEY,'seeded');
+      cloudReady=true;
+      showCloudStatus('প্রথম Cloud Backup সফল','success');
+      return;
+    }
+    // Cloud is the shared source of truth. Apply it when the cloud version changed.
+    if(marker !== cloud.updated_at){
+      applySnapshot(state);
+      localStorage.setItem(HYDRATED_KEY,cloud.updated_at || 'loaded');
+      cloudReady=true;
+      showCloudStatus('Cloud থেকে ডাটা লোড হয়েছে','success');
+      setTimeout(()=>location.reload(),250);
+      return;
+    }
+    cloudReady=true;
+    showCloudStatus('Supabase Cloud Connected','success');
+  }
+  async function writeCloudInitial(){
+    const {data:{user}}=await supabase.auth.getUser();
+    if(!user) throw new Error('Admin session পাওয়া যায়নি।');
+    const {error}=await supabase.from(TABLE).upsert({
+      id:STORE_ID,state:makeSnapshot(),updated_at:new Date().toISOString(),updated_by:user.id
+    },{onConflict:'id'});
+    if(error) throw error;
+  }
+  function establishLocalAdmin(email){
+    const username=String(email||'admin').toLowerCase();
+    let users={};
+    try{users=JSON.parse(localStorage.getItem(USERS_KEY)||'{}')||{};}catch(e){}
+    // Local app permissions only; authentication is always checked by Supabase.
+    users[username]={name:'Admin',role:'admin',active:true,password:'SUPABASE_AUTH_ONLY'};
+    localStorage.setItem(USERS_KEY,JSON.stringify(users));
+    localStorage.setItem(SESSION_KEY,JSON.stringify({
+      username:username,name:'Admin',role:'admin',loggedAt:Date.now(),provider:'supabase'
+    }));
+  }
+  async function finishAuth(session){
+    if(!session || !session.user) return;
+    establishLocalAdmin(session.user.email);
+    const overlay=document.getElementById('loginOverlay');
+    if(overlay) overlay.classList.add('hidden');
+    const label=document.getElementById('loggedInUser');
+    if(label) label.textContent=(session.user.email||'Admin')+' • Admin';
+    document.body.dataset.userRole='admin';
+    await syncCloudOnLogin();
+  }
+  async function handleLogin(e){
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    setError('');
+    const email=(document.getElementById('loginUsername')?.value||'').trim();
+    const password=document.getElementById('loginPassword')?.value||'';
+    if(!email || !password){setError('Admin Email এবং Password দিন।');return;}
+    setBusy(true);
+    try{
+      const {data,error}=await supabase.auth.signInWithPassword({email,password});
+      if(error) throw error;
+      if(data.session){
+        await finishAuth(data.session);
+        const pass=document.getElementById('loginPassword');if(pass)pass.value='';
+      }
+    }catch(err){setError(errorText(err));}
+    finally{setBusy(false);}
+  }
+  async function boot(){
+    if(!window.supabase || !window.supabase.createClient){
+      setError('Supabase library লোড হয়নি। ইন্টারনেট সংযোগ পরীক্ষা করুন।');
+      return;
+    }
+    supabase=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{
+      auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}
+    });
+    window.rupantorSupabase=supabase;
+    const form=document.getElementById('loginForm');
+    if(form) form.addEventListener('submit',handleLogin,true);
+    // Prevent the old local-password login path from being used.
+    try{
+      const {data,error}=await supabase.auth.getSession();
+      if(error) throw error;
+      if(data.session) await finishAuth(data.session);
+      else{
+        cloudReady=false;
+        localStorage.removeItem(SESSION_KEY);
+        const overlay=document.getElementById('loginOverlay');if(overlay)overlay.classList.remove('hidden');
+        const userInput=document.getElementById('loginUsername');
+        if(userInput){userInput.type='email';userInput.placeholder='Supabase Admin Email';userInput.autocomplete='username';}
+        const label=document.querySelector('label[for="loginUsername"]');if(label)label.textContent='Admin Email';
+      }
+    }catch(err){setError('Supabase সংযোগ সমস্যা: '+errorText(err));}
+    supabase.auth.onAuthStateChange((event,session)=>{
+      if(event==='SIGNED_OUT'){
+        cloudReady=false;localStorage.removeItem(SESSION_KEY);
+        const overlay=document.getElementById('loginOverlay');if(overlay)overlay.classList.remove('hidden');
+      }
+    });
+  }
+  // Keep localStorage as the app's working cache, and mirror POS data to Supabase.
+  const originalSetItem=Storage.prototype.setItem;
+  Storage.prototype.setItem=function(key,value){
+    originalSetItem.call(this,key,value);
+    if(this===localStorage && typeof key==='string' && key.startsWith('rupantor_pos_') &&
+       key!==USERS_KEY && key!=='rupantor_pos_roles_v2') queueCloudSave();
+  };
+  const originalRemoveItem=Storage.prototype.removeItem;
+  Storage.prototype.removeItem=function(key){
+    originalRemoveItem.call(this,key);
+    if(this===localStorage && typeof key==='string' && key.startsWith('rupantor_pos_')) queueCloudSave();
+  };
+  window.posLogout=async function(){
+    cloudReady=false;
+    if(supabase) await supabase.auth.signOut();
+    localStorage.removeItem(SESSION_KEY);
+    document.body.dataset.userRole='';
+    const overlay=document.getElementById('loginOverlay');if(overlay)overlay.classList.remove('hidden');
+    const pass=document.getElementById('loginPassword');if(pass)pass.value='';
+  };
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot);
+  else boot();
 })();
 </script>
 
